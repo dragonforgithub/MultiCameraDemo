@@ -46,7 +46,7 @@ class HCamera2Manager2 {
     private SurfaceHolder mSurfaceHolder;
     private Handler mThreadHandler;
     private  TextureView mTextureView;
-    private final int mStartCameraId = 152;
+    private final int mCameraId = 153;
     private final int mWidth = 1920;
     private final int mHeight = 1080;
     private final Size mPreviewSize = new Size(mWidth,mHeight);
@@ -57,7 +57,8 @@ class HCamera2Manager2 {
     private CameraDevice mCameraDevice;
     private H264Encoder mH264Encoder;
     private ImageReader mImageReader;
-
+    private Thread mListThread;
+    
     public static byte[] h264 = new byte[2073600]; //y-2073600 u-1036799 v-1036799
 
     public static HCamera2Manager2 getInstance() {
@@ -82,6 +83,8 @@ class HCamera2Manager2 {
         public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
             //当SurfaceTexture可用的时候，设置相机参数并打开相机
             startCamera();
+            //开启设备列表监听，在设备可用时打开
+            //mListThread.start();
         }
 
         @Override
@@ -201,18 +204,46 @@ class HCamera2Manager2 {
         mThreadHandler = new Handler(handlerThread.getLooper());
         //mImageReader = ImageReader.newInstance(Constant.WIDTH,Constant.HEIGHT, ImageFormat.YUV_420_888,1);
         //mImageReader.setOnImageAvailableListener(onImageAvailableListener2, mThreadHandler);
+
+        CameraManager cameraManager = (CameraManager) mContext.getSystemService(Context.CAMERA_SERVICE);
+        mListThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                do {
+                    try {
+                        String[] cameraIdList = cameraManager.getCameraIdList();
+                        //Log.i(TAG, "startCamera: monitoring ...... cameraList=" + Arrays.toString(cameraIdList));
+                        for (String cameraId : cameraIdList) {
+                            if (Objects.equals(cameraId, Integer.toString(mCameraId))) {
+                                Thread.sleep(500);
+                                if (mCameraDevice == null) {
+                                    startCamera();
+                                }
+                                break;
+                            }
+                        }
+                        Thread.sleep(1000);
+                    } catch (CameraAccessException e) {
+                        throw new RuntimeException(e);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                } while (true);
+            }
+        });
     }
 
     //close camera
     public void closeCamera() {
+        Log.i(TAG, "====== closeCamera ======");
         if (mCameraDevice != null){
             mCameraDevice.close();
+            mCameraDevice = null;
         }
         if (mImageReader != null){
             mImageReader.close();
             mImageReader = null;
         }
-        mContext = null;
     }
 
     private void startCamera() {
@@ -235,7 +266,7 @@ class HCamera2Manager2 {
                 String useCameraId = "";
                 Log.i(TAG, "startCamera: cameraList=" + Arrays.toString(cameraIdList));
                 for (String cameraId : cameraIdList) {
-                    if (Objects.equals(cameraId, Integer.toString(mStartCameraId+1))) {
+                    if (Objects.equals(cameraId, Integer.toString(mCameraId))) {
                         useCameraId = cameraId;
                         Log.i(TAG, "Found useCameraId : " + useCameraId);
                         break;
@@ -263,11 +294,12 @@ class HCamera2Manager2 {
                     @Override
                     public void onError(@NonNull CameraDevice camera, int error) {
                         Log.d(TAG, "onError: " + error);
+                        closeCamera();
                     }
                 }, new Handler(mContext.getMainLooper()));
             } catch (CameraAccessException e) {
                 Log.e(TAG, "startCamera: open fail", e);
-            }finally {
+            } finally {
                 Log.d(TAG, "startCamera: over");
             }
         }

@@ -11,10 +11,15 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
+import android.media.AudioTrack;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.MediaRecorder;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.text.TextUtils;
@@ -31,6 +36,8 @@ import androidx.core.app.ActivityCompat;
 
 import org.jetbrains.annotations.Nullable;
 
+import java.io.File;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,7 +55,7 @@ class HCamera2Manager {
     private SurfaceHolder mSurfaceHolder;
     private Handler mThreadHandler;
     private  TextureView mTextureView;
-    private final int mStartCameraId = 152;
+    private final int mCameraId = 152;
     private final int mWidth = 1920;
     private final int mHeight = 1080;
     private final Size mPreviewSize = new Size(mWidth,mHeight);
@@ -59,8 +66,16 @@ class HCamera2Manager {
     private CameraDevice mCameraDevice;
     private H264Encoder mH264Encoder;
     private ImageReader mImageReader;
+    private MediaRecorder mMediaRecorder;
+    private CaptureRequest.Builder mRecordRequestBuilder;
+    private Thread mListThread;
+    private static byte[] h264 = new byte[2073600]; //y-2073600 u-1036799 v-1036799
 
-    public static byte[] h264 = new byte[2073600]; //y-2073600 u-1036799 v-1036799
+    private AudioRecord mAudioRecord;
+    private AudioTrack mAudioTrack;
+    private int mBufferSize;
+    private byte[] mRecordBuffer;
+    private Thread mPlayThread;
 
     public static HCamera2Manager getInstance() {
         if (ins == null) {
@@ -76,14 +91,18 @@ class HCamera2Manager {
     private HCamera2Manager() {
     }
 
-    public void addH264Decoder(H264Decoder h264Decoder){
+    public void addH264Decoder(H264Decoder h264Decoder) {
         mH264DecoderArrayList.add(h264Decoder);
     }
+
     private TextureView.SurfaceTextureListener mTextureListener = new TextureView.SurfaceTextureListener() {
         @Override
         public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
             //当SurfaceTexture可用的时候，设置相机参数并打开相机
             startCamera();
+
+            //开启设备列表监听，在设备可用时打开
+            //mListThread.start();
         }
 
         @Override
@@ -185,6 +204,7 @@ class HCamera2Manager {
         }
     };
 
+    @RequiresApi(api = Build.VERSION_CODES.M)
     public void initCamera(TextureView view, @Nullable Context applicationContext){
         if (view == null || applicationContext == null){
             Log.e(TAG, "initCamera: return");
@@ -203,22 +223,57 @@ class HCamera2Manager {
         mThreadHandler = new Handler(handlerThread.getLooper());
         //mImageReader = ImageReader.newInstance(Constant.WIDTH,Constant.HEIGHT, ImageFormat.YUV_420_888,1);
         //mImageReader.setOnImageAvailableListener(onImageAvailableListener2, mThreadHandler);
+        mMediaRecorder = new MediaRecorder();
+        try {
+            setUpMediaRecorder();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        CameraManager cameraManager = (CameraManager) mContext.getSystemService(Context.CAMERA_SERVICE);
+        mListThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                    do {
+                        try {
+                            String[] cameraIdList = cameraManager.getCameraIdList();
+                            //Log.i(TAG, "startCamera: monitoring ...... cameraList=" + Arrays.toString(cameraIdList));
+                            for (String cameraId : cameraIdList) {
+                                if (Objects.equals(cameraId, Integer.toString(mCameraId))) {
+                                    Thread.sleep(500);
+                                    if (mCameraDevice == null) {
+                                        startCamera();
+                                    }
+                                    break;
+                                }
+                            }
+                            Thread.sleep(1000);
+                        } catch (CameraAccessException e) {
+                            throw new RuntimeException(e);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                    } while (true);
+                }
+            });
     }
 
     //close camera
     public void closeCamera() {
+        Log.i(TAG, "====== closeCamera ======");
         if (mCameraDevice != null){
             mCameraDevice.close();
+            mCameraDevice = null;
         }
         if (mImageReader != null){
             mImageReader.close();
             mImageReader = null;
         }
-        mContext = null;
     }
 
+
     private void startCamera() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Log.d(TAG, "startCamera: start");
             CameraManager cameraManager = (CameraManager) mContext.getSystemService(Context.CAMERA_SERVICE);
             if (cameraManager == null){
@@ -237,7 +292,7 @@ class HCamera2Manager {
                 String useCameraId = "";
                 Log.i(TAG, "startCamera: cameraList=" + Arrays.toString(cameraIdList));
                 for (String cameraId : cameraIdList) {
-                    if (Objects.equals(cameraId, Integer.toString(mStartCameraId))) {
+                    if (Objects.equals(cameraId, Integer.toString(mCameraId))) {
                         useCameraId = cameraId;
                         Log.i(TAG, "Found useCameraId : " + useCameraId);
                         break;
@@ -265,6 +320,7 @@ class HCamera2Manager {
                     @Override
                     public void onError(@NonNull CameraDevice camera, int error) {
                         Log.d(TAG, "onError: " + error);
+                        closeCamera();
                     }
                 }, new Handler(mContext.getMainLooper()));
             } catch (CameraAccessException e) {
@@ -279,31 +335,127 @@ class HCamera2Manager {
         SurfaceTexture mSurfaceTexture = mTextureView.getSurfaceTexture();
         assert mSurfaceTexture != null;
         mSurfaceTexture.setDefaultBufferSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
-
         Surface previewSurface = new Surface(mSurfaceTexture);
+        Surface recorderSurface = mMediaRecorder.getSurface(); //获取录制视频需要的Surface
         try {
-            mCaptureRequestBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            mCaptureRequestBuilder.addTarget(previewSurface);
-            mCameraDevice.createCaptureSession(Collections.singletonList(previewSurface), new CameraCaptureSession.StateCallback() {
+            mRecordRequestBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+            //将MediaRecorder和预览用的Surface实例添加到请求的目标列表中
+            mRecordRequestBuilder.addTarget(previewSurface);
+            mRecordRequestBuilder.addTarget(recorderSurface);
+
+            cameraDevice.createCaptureSession(Arrays.asList(previewSurface,recorderSurface),new CameraCaptureSession.StateCallback() {
                 @Override
-                public void onConfigured(@NonNull CameraCaptureSession session) {
-                    mCaptureRequest = mCaptureRequestBuilder.build();
-                    mCameraCaptureSession = session;
-                    try {
-                        mCameraCaptureSession.setRepeatingRequest(mCaptureRequest, null, mThreadHandler);
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
+                public void onConfigured(CameraCaptureSession cameraCaptureSession) {
+                    mCameraCaptureSession = cameraCaptureSession;
+                    Log.i(TAG, "Video Session:" + mCameraCaptureSession.toString());
+                    mRecordRequestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+                    mThreadHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                mCameraCaptureSession.setRepeatingRequest(mRecordRequestBuilder.build(), null, mThreadHandler);
+                            } catch (CameraAccessException e) {
+                                throw new RuntimeException("Can't visit camera");
+                            }
+                        }
+                    });
                 }
-
                 @Override
-                public void onConfigureFailed(@NonNull CameraCaptureSession session) {
-
+                public void onConfigureFailed(CameraCaptureSession cameraCaptureSession) {
                 }
             }, mThreadHandler);
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * 设置媒体录制器的配置参数
+     * <p>
+     * 音频，视频格式，文件路径，频率，编码格式等等
+     *
+     * @throws IOException
+     */
+    @RequiresApi(api = Build.VERSION_CODES.M)
+    private void setUpMediaRecorder() throws IOException {
+        //初始化视频录制模块
+        mMediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);//设置音频来源
+        mMediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);//设置视频来源
+        mMediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);//设置输出格式
+        mMediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.DEFAULT);//设置音频编码格式，请注意这里使用默认，实际app项目需要考虑兼容问题，应该选择AAC
+        mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.DEFAULT);//设置视频编码格式，请注意这里使用默认，实际app项目需要考虑兼容问题，应该选择H264
+        mMediaRecorder.setVideoEncodingBitRate(mPreviewSize.getWidth()*mPreviewSize.getHeight()*8);//设置比特率 一般是 1*分辨率 到 10*分辨率之间波动。比特率越大视频越清晰但是视频文件也越大。
+        mMediaRecorder.setVideoFrameRate(30);//设置帧数.
+        mMediaRecorder.setVideoSize(mPreviewSize.getWidth(),mPreviewSize.getHeight());
+        mMediaRecorder.setOrientationHint(0);
+        //mMediaRecorder.setPreviewDisplay(new Surface(mTextureView.getSurfaceTexture())); //startPreview()中已配置
+        String parentFile = Environment.getExternalStorageDirectory().getAbsolutePath() + "/DCIM";
+        String fileName = System.currentTimeMillis() + ".mp4";
+        mMediaRecorder.setOutputFile(parentFile + File.separator + fileName);
+        try {
+            mMediaRecorder.prepare();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void startRecord() {
+        mMediaRecorder.start();
+    }
+
+    public void stopRecord() {
+        mMediaRecorder.stop();
+        mMediaRecorder.reset();
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                setUpMediaRecorder();
+                startCamera();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 设置录音/播放的配置参数
+     */
+    private void setUpAudioRecorder() {
+        int sampleRate = 16000; // 采样率
+        int channelConfig = AudioFormat.CHANNEL_IN_DEFAULT; // 单声道
+        int audioFormat = AudioFormat.ENCODING_PCM_16BIT; // 格式
+        mBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat);
+
+        mRecordBuffer = new byte[mBufferSize];
+        mAudioRecord = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, channelConfig, audioFormat, mBufferSize);
+        mAudioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, channelConfig, audioFormat, mBufferSize, AudioTrack.MODE_STREAM);
+
+        mPlayThread = new Thread(new Runnable() {
+            public void run() {
+                mAudioRecord.startRecording();
+                Log.i(TAG, "start recording & playing ......");
+                boolean isRecording = (mAudioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING);
+                while (isRecording) {
+                    int bufferReadResult = mAudioRecord.read(mRecordBuffer, 0, mBufferSize);
+                    if (bufferReadResult > 0) {
+                        mAudioTrack.write(mRecordBuffer, 0, bufferReadResult);
+                    }
+                }
+                Log.i(TAG, "record stop !!!");
+            }
+        });
+    }
+
+    public void startPlay() {
+        setUpAudioRecorder();
+        mAudioTrack.play();
+        mPlayThread.start();
+    }
+
+    public void stopPlay() {
+        mAudioRecord.stop();
+        mAudioRecord.release();
+        mAudioTrack.stop();
+        mAudioTrack.release();
     }
 }
 
